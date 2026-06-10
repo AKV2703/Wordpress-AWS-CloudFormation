@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: WordPress application infrastructure stack
+
+Parameters:
+
+  # Name of the networking stack
+  NetworkStackName:
+    Type: String
+    Default: wordpress-network-stack
+
+  # Existing Learner Lab instance profile
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    
+  # EC2 key pair
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: vockey
+
+  # Latest Amazon Linux 2 AMI
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  # EC2 instance type
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+  # Database name
+  DBName:
+    Type: String
+    Default: wordpressdb
+
+  # Database username
+  DBUsername:
+    Type: String
+    Default: admin
+
+  # Database password
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+
+  # ALB security group allows HTTP from internet
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from internet to ALB
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: wordpress-alb-sg
+
+  # Web server security group allows HTTP only from ALB
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB to web servers
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: wordpress-web-server-sg
+
+  # RDS security group allows MySQL only from web servers
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from web servers to RDS
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: wordpress-rds-sg
+
+  # RDS subnet group uses private subnets only
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for WordPress RDS
+      SubnetIds:
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+      Tags:
+        - Key: Name
+          Value: wordpress-db-subnet-group
+
+  # Create MySQL RDS database
+  WordPressDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: wordpress-primary-db
+      DBName: !Ref DBName
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      PubliclyAccessible: false
+      MultiAZ: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: wordpress-primary-rds
+
+  # Create RDS read replica
+  WordPressReadReplica:
+    Type: AWS::RDS::DBInstance
+    DependsOn: WordPressDB
+    Properties:
+      DBInstanceIdentifier: wordpress-read-replica
+      SourceDBInstanceIdentifier: !Ref WordPressDB
+      DBInstanceClass: db.t3.micro
+      PubliclyAccessible: false
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: wordpress-read-replica
+
+  # Create private S3 bucket for WordPress media
+  WordPressMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: wordpress-media-bucket
+
+  # Add private bucket policy
+  WordPressMediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WordPressMediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${WordPressMediaBucket.Arn}"
+              - !Sub "${WordPressMediaBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Create launch template for WordPress web servers
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum -y update
+            amazon-linux-extras install php8.2 -y
+            yum -y install httpd mysql php php-mysqlnd php-mbstring php-xml php-gd php-curl php-zip wget
+            wget http://wordpress.org/latest.tar.gz -P /tmp/
+            tar zxvf /tmp/latest.tar.gz -C /tmp
+            cp -r /tmp/wordpress/* /var/www/html/
+            chown apache:apache -R /var/www/html
+            systemctl enable httpd.service
+            systemctl start httpd.service
+
+  # Create target group for web servers
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${NetworkStackName}-VpcId"
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: wordpress-target-group
+
+  # Create Application Load Balancer in public subnets
+  WordPressALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PublicSubnet1Id"
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PublicSubnet2Id"
+      Tags:
+        - Key: Name
+          Value: wordpress-alb
+
+  # Create HTTP listener for ALB
+  WordPressListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+  # Create Auto Scaling Group
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - WordPressListener
+    Properties:
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+        - Fn::ImportValue:
+            Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: wordpress-web-server
+          PropagateAtLaunch: true
+
+  # Create scale out policy
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  # Create scale in policy
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+  # Create high CPU alarm
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale out when CPU is above 70 percent
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WordPressAutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+
+  # Create low CPU alarm
+  LowCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale in when CPU is below 25 percent
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WordPressAutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ScaleInPolicy
+
+Outputs:
+
+  # Output ALB URL
+  LoadBalancerDNS:
+    Description: WordPress website URL
+    Value: !Sub "http://${WordPressALB.DNSName}"
+    
+  # Output S3 bucket name
+  MediaBucketName:
+    Description: S3 bucket for WordPress media
+    Value: !Ref WordPressMediaBucket
+
+  # Output primary RDS endpoint
+  RDSEndpoint:
+    Description: Primary RDS endpoint
+    Value: !GetAtt WordPressDB.Endpoint.Address
+    
+  # Output read replica endpoint
+  ReadReplicaEndpoint:
+    Description: Read replica endpoint
+    Value: !GetAtt WordPressReadReplica.Endpoint.Address
